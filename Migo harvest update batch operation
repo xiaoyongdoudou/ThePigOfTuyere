@@ -1,0 +1,323 @@
+DATA:lv_mblnr TYPE mblnr,
+     lv_mjahr TYPE mjahr.
+*     ls_mkpf  TYPE mkpf,
+*     lt_mseg  TYPE TABLE OF mseg.
+DATA: g_classname  TYPE rzlli_apcl,   "Server Group Name
+      g_applserver TYPE rzllitab-applserver. "RFC Serve Group
+
+DATA : gname   LIKE seqg3-gname VALUE 'MKPF',
+       garg    LIKE  seqg3-garg,
+       raw_enq LIKE  seqg7 OCCURS 0 WITH HEADER LINE,
+       guname  LIKE  seqg3-guname.
+
+CALL 'C_SAPGPARAM'
+         ID 'NAME'  FIELD 'rdisp/myname'
+         ID 'VALUE'  FIELD g_applserver.
+SELECT SINGLE classname
+            FROM   rzllitab
+            INTO   g_classname   "Server Group Name
+           WHERE   applserver = g_applserver
+             AND   grouptype = 'S'.   "S:服务器组，空:登陆组
+
+READ TABLE doc_head_tab INTO DATA(ls_bkpf) INDEX 1.
+CHECK ls_bkpf-awkey IS NOT INITIAL.
+CLEAR:lv_mblnr,lv_mjahr.
+lv_mblnr = ls_bkpf-awkey+0(10).
+lv_mjahr = ls_bkpf-awkey+10(4).
+
+
+IF sy-tcode = 'MIGO'.
+  CALL FUNCTION 'ZFM_MM_CREATE_BATCH_DEST' STARTING NEW TASK lv_mblnr
+    DESTINATION IN GROUP g_classname
+    " PERFORMING frm_batch_upload ON END OF TASK
+    EXPORTING
+      iv_mblnr = lv_mblnr
+      iv_mjahr = lv_mjahr.
+ENDIF.
+
+
+
+"FORM frm_batch_upload USING lv_mblnr.
+  "RECEIVE RESULTS FROM FUNCTION 'ZFM_MM_CREATE_BATCH_DEST'.
+"ENDFORM.
+
+
+rfc  content
+FUNCTION zfm_mm_create_batch_dest.
+*"----------------------------------------------------------------------
+*"*"本地接口：
+*"  IMPORTING
+*"     VALUE(IV_MBLNR) TYPE  MBLNR OPTIONAL
+*"     VALUE(IV_MJAHR) TYPE  MJAHR OPTIONAL
+*"----------------------------------------------------------------------
+  DATA:iv_matnr  TYPE matnr,
+       iv_werks  TYPE werks_d,
+       iv_charg  TYPE charg_d,
+       e_objek   TYPE cuobn,
+       e_obtab   TYPE tabelle,
+       e_klart   TYPE klassenart,
+       e_class   TYPE klasse_d,
+       lt_num    TYPE TABLE OF bapi1003_alloc_values_num,
+       lt_char   TYPE TABLE OF bapi1003_alloc_values_char,
+       lt_curr   TYPE TABLE OF bapi1003_alloc_values_curr,
+       it_mseg   TYPE TABLE OF mseg,
+       is_mkpf   TYPE mkpf,
+       lt_return TYPE TABLE OF bapiret2.
+
+
+  CLEAR:is_mkpf,it_mseg[].
+  DO 10 TIMES.
+    SELECT SINGLE * INTO CORRESPONDING FIELDS OF is_mkpf FROM mkpf WHERE mblnr = iv_mblnr AND mjahr = iv_mjahr.
+    IF sy-subrc = 0.
+      EXIT.
+    ELSE.
+      WAIT UP TO 1 SECONDS.
+    ENDIF.
+  ENDDO.
+
+  IF is_mkpf IS  INITIAL.
+    EXIT.
+  ENDIF.
+
+  SELECT * INTO CORRESPONDING FIELDS OF TABLE it_mseg FROM mseg WHERE mblnr = iv_mblnr AND mjahr = iv_mjahr.
+
+*       ls_catt   TYPE bapibatchatt.
+  "产地 生产厂家编码 生产产家
+  SELECT FROM ekpo AS a
+  INNER JOIN ztcqm002 AS b
+  ON a~werks = b~werks AND
+     a~matnr = b~matnr AND
+     a~idnlf = b~zid
+  FIELDS
+  a~ebeln,a~ebelp,a~matnr,a~idnlf,
+  b~zid,b~zscsmc,b~zchandi
+  FOR ALL ENTRIES IN @it_mseg[]
+  WHERE ebeln = @it_mseg-ebeln
+    AND ebelp = @it_mseg-ebelp
+    AND zdel = ''
+   INTO TABLE @DATA(lt_ekpo).
+  SORT lt_ekpo BY ebeln ebelp matnr.
+  DELETE ADJACENT DUPLICATES FROM lt_ekpo COMPARING ebeln ebelp matnr.
+* 上市许可持有人：证书类型Z032
+* 第二类医疗器械经营备案凭证：证书类型Z015
+* 医疗器械经营许可证：证书类型Z017
+  SELECT FROM ztgsp_lic_mas AS a
+    INNER JOIN t001k AS b
+    ON a~bukrs = b~bukrs
+    INNER JOIN ztgsp_bukrs AS c
+    ON a~bukrs = c~bukrs
+    FIELDS
+    a~zzlicid,b~bwkey AS werks,a~bukrs,a~matnr,a~zzholder,a~zzlictyp,a~zzlicno
+    FOR ALL ENTRIES IN @it_mseg
+    WHERE matnr = @it_mseg-matnr
+      AND zzlictyp IN ('Z032','Z015','Z017')
+      AND zzvalto > @sy-datum
+      AND b~bwkey = @it_mseg-werks
+     INTO TABLE @DATA(lt_lic_mas).
+  SORT lt_lic_mas BY werks matnr zzlictyp.
+  DELETE ADJACENT DUPLICATES FROM lt_lic_mas COMPARING werks matnr zzlictyp.
+*注册证/备案号取数逻辑：
+  SELECT FROM ztmm_master_bas
+    FIELDS
+    matnr,
+    zzcba
+    FOR ALL ENTRIES IN @it_mseg
+    WHERE matnr = @it_mseg-matnr
+    INTO TABLE @DATA(lt_master_bas).
+  SORT lt_master_bas BY matnr.
+  LOOP AT it_mseg ASSIGNING FIELD-SYMBOL(<fs_mseg>) WHERE bwart = '101'
+                                                      AND  kzbew = 'B' AND charg IS NOT INITIAL.
+    CLEAR:
+       iv_matnr,
+       iv_werks,
+       iv_charg,
+       e_objek,
+       e_obtab,
+       e_klart,
+       e_class,
+*       ls_catt,
+       lt_num[],
+       lt_char[],
+       lt_curr[],
+       lt_return[].
+    iv_matnr = <fs_mseg>-matnr.
+    iv_werks = <fs_mseg>-werks.
+    iv_charg = <fs_mseg>-charg.
+    CALL FUNCTION 'VB_BATCH_2_CLASS_OBJECT'
+      EXPORTING
+        i_matnr = iv_matnr
+        i_charg = iv_charg
+        i_werks = iv_werks
+      IMPORTING
+        e_objek = e_objek
+        e_obtab = e_obtab
+        e_klart = e_klart
+        e_class = e_class.
+    CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+      EXPORTING
+*       OBJECTKEY       =
+        objecttable     = e_obtab
+        classnum        = e_class
+        classtype       = e_klart
+*       KEYDATE         = SY-DATUM
+*       UNVALUATED_CHARS       = ' '
+*       LANGUAGE        = SY-LANGU
+        objectkey_long  = e_objek
+* IMPORTING
+*       STATUS          =
+*       STANDARDCLASS   =
+      TABLES
+        allocvaluesnum  = lt_num
+        allocvalueschar = lt_char
+        allocvaluescurr = lt_curr
+        return          = lt_return.
+    READ TABLE lt_ekpo ASSIGNING FIELD-SYMBOL(<fs_ekpo>) WITH KEY ebeln = <fs_mseg>-ebeln
+                                                                  ebelp = <fs_mseg>-ebelp
+                                                                  matnr = <fs_mseg>-matnr
+                                                                  BINARY SEARCH.
+    IF sy-subrc = 0.
+      IF e_class = 'Z_BATCH01'.
+        " 生产厂家编号
+        IF <fs_ekpo>-zid IS NOT INITIAL.
+          READ TABLE lt_char ASSIGNING FIELD-SYMBOL(<fs_char>) WITH KEY charact = 'Z_DATA21'.
+          IF sy-subrc = 0.
+            <fs_char>-value_char     = <fs_ekpo>-zid.
+            <fs_char>-value_neutral  = <fs_ekpo>-zid.
+          ELSE.
+            APPEND INITIAL LINE TO lt_char ASSIGNING <fs_char>.
+            <fs_char>-charact        = 'Z_DATA21'.
+            <fs_char>-value_char     = <fs_ekpo>-zid.
+            <fs_char>-value_neutral  = <fs_ekpo>-zid.
+          ENDIF.
+        ENDIF.
+        "生产厂家
+        IF <fs_ekpo>-zscsmc IS NOT INITIAL.
+          IF <fs_char> IS ASSIGNED.
+            UNASSIGN <fs_char>.
+          ENDIF.
+          READ TABLE lt_char ASSIGNING <fs_char> WITH KEY charact = 'Z_DATA05'.
+          IF sy-subrc = 0.
+            <fs_char>-value_char     = <fs_ekpo>-zscsmc.
+            <fs_char>-value_neutral  = <fs_ekpo>-zscsmc.
+          ELSE.
+            APPEND INITIAL LINE TO lt_char ASSIGNING <fs_char>.
+            <fs_char>-charact        = 'Z_DATA05'.
+            <fs_char>-value_char     = <fs_ekpo>-zscsmc.
+            <fs_char>-value_neutral  = <fs_ekpo>-zscsmc.
+          ENDIF.
+        ENDIF.
+        "产地
+        IF <fs_ekpo>-zchandi IS NOT INITIAL.
+          IF <fs_char> IS ASSIGNED.
+            UNASSIGN <fs_char>.
+          ENDIF.
+          READ TABLE lt_char ASSIGNING <fs_char> WITH KEY charact = 'Z_DATA23'.
+          IF sy-subrc = 0.
+            <fs_char>-value_char     = <fs_ekpo>-zchandi.
+            <fs_char>-value_neutral  = <fs_ekpo>-zchandi.
+          ELSE.
+            APPEND INITIAL LINE TO lt_char ASSIGNING <fs_char>.
+            <fs_char>-charact        = 'Z_DATA23'.
+            <fs_char>-value_char     = <fs_ekpo>-zchandi.
+            <fs_char>-value_neutral  = <fs_ekpo>-zchandi.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+    IF e_class = 'Z_BATCH03'.
+      READ TABLE lt_lic_mas ASSIGNING FIELD-SYMBOL(<fs_lic_mas>) WITH KEY werks = <fs_mseg>-werks"4.2.6  上市许可持有人
+                                                                          matnr = <fs_mseg>-matnr
+                                                                          zzlictyp = 'Z032'
+                                                                          BINARY SEARCH.
+      IF sy-subrc = 0.
+        READ TABLE lt_char ASSIGNING <fs_char> WITH KEY charact = 'Z_DATA43'.
+        IF sy-subrc = 0.
+          <fs_char>-value_char     = <fs_lic_mas>-zzlicno.
+          <fs_char>-value_neutral  = <fs_lic_mas>-zzlicno.
+        ELSE.
+          APPEND INITIAL LINE TO lt_char ASSIGNING <fs_char>.
+          <fs_char>-charact        = 'Z_DATA43'.
+          <fs_char>-value_char     = <fs_lic_mas>-zzlicno.
+          <fs_char>-value_neutral  = <fs_lic_mas>-zzlicno.
+        ENDIF.
+      ENDIF.
+      READ TABLE lt_lic_mas ASSIGNING <fs_lic_mas> WITH KEY werks    = <fs_mseg>-werks
+                                                            matnr    = <fs_mseg>-matnr
+                                                            zzlictyp = 'Z015'
+                                                            BINARY SEARCH.
+      IF sy-subrc = 0.
+        READ TABLE lt_char ASSIGNING <fs_char> WITH KEY charact = 'Z_DATA45'."4.2.8  医疗器械经营许可证
+        IF sy-subrc = 0.
+          <fs_char>-value_char     = <fs_lic_mas>-zzlicno.
+          <fs_char>-value_neutral  = <fs_lic_mas>-zzlicno.
+        ELSE.
+          APPEND INITIAL LINE TO lt_char ASSIGNING <fs_char>.
+          <fs_char>-charact        = 'Z_DATA45'.
+          <fs_char>-value_char     = <fs_lic_mas>-zzlicno.
+          <fs_char>-value_neutral  = <fs_lic_mas>-zzlicno.
+        ENDIF.
+      ENDIF.
+      READ TABLE lt_lic_mas ASSIGNING <fs_lic_mas> WITH KEY werks    = <fs_mseg>-werks
+                                                            matnr    = <fs_mseg>-matnr
+                                                            zzlictyp = 'Z017'
+                                                            BINARY SEARCH.
+      IF sy-subrc = 0.
+        READ TABLE lt_char ASSIGNING <fs_char> WITH KEY charact = 'Z_DATA46'."4.2.8  医疗器械经营许可证
+        IF sy-subrc = 0.
+          <fs_char>-value_char     = <fs_lic_mas>-zzlicno.
+          <fs_char>-value_neutral  = <fs_lic_mas>-zzlicno.
+        ELSE.
+          APPEND INITIAL LINE TO lt_char ASSIGNING <fs_char>.
+          <fs_char>-charact        = 'Z_DATA46'.
+          <fs_char>-value_char     = <fs_lic_mas>-zzlicno.
+          <fs_char>-value_neutral  = <fs_lic_mas>-zzlicno.
+        ENDIF.
+      ENDIF.
+      READ TABLE lt_master_bas ASSIGNING FIELD-SYMBOL(<fs_master_bas>) WITH KEY matnr = <fs_mseg>-matnr BINARY SEARCH.
+      IF sy-subrc = 0.
+        READ TABLE lt_char ASSIGNING <fs_char> WITH KEY charact = 'Z_DATA44'.
+        IF sy-subrc = 0.
+          <fs_char>-value_char     = <fs_master_bas>-zzcba.
+          <fs_char>-value_neutral  = <fs_master_bas>-zzcba.
+        ELSE.
+          APPEND INITIAL LINE TO lt_char ASSIGNING <fs_char>.
+          <fs_char>-charact        = 'Z_DATA44'.
+          <fs_char>-value_char     = <fs_master_bas>-zzcba.
+          <fs_char>-value_neutral  = <fs_master_bas>-zzcba.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+    CALL FUNCTION 'BAPI_OBJCL_CHANGE' "对特性值进行一次更改
+      EXPORTING
+*       OBJECTKEY          = E_OBJEK
+        objecttable        = e_obtab
+        classnum           = e_class
+        classtype          = e_klart
+        objectkey_long     = e_objek
+*      IMPORTING
+*       CLASSIF_STATUS     = V_STATUS
+      TABLES
+        allocvaluesnumnew  = lt_num
+        allocvaluescharnew = lt_char
+        allocvaluescurrnew = lt_curr
+        return             = lt_return
+      EXCEPTIONS
+        OTHERS             = 01.
+
+    DATA:lv_check TYPE c.
+    CLEAR:lv_check.
+    LOOP AT lt_return ASSIGNING FIELD-SYMBOL(<lfs_rettab>) WHERE type CA 'AEX'.
+      ROLLBACK WORK.
+      lv_check = 'X'.
+      EXIT.
+    ENDLOOP.
+
+    IF lv_check = ''.
+      COMMIT WORK .
+    ENDIF.
+  ENDLOOP.
+ENDFUNCTION.
+
+
+
+
